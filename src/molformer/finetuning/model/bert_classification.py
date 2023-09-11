@@ -5,15 +5,14 @@ import os
 import torch.nn.functional as F
 import numpy as np
 import random
-from pytorch_lightning.loggers import TensorBoardLogger
-import pytorch_lightning as pl
-from pytorch_lightning.utilities import rank_zero_warn, rank_zero_only, seed
+from lightning.pytorch.loggers import TensorBoardLogger
+import lightning.pytorch as pl
+from lightning.pytorch.utilities import rank_zero_warn, rank_zero_only, seed
 from molformer.tokenizer import MolTranBertTokenizer
 from fast_transformers.masking import LengthMask as LM
 from attention_modules.rotate_builder import RotateEncoderBuilder as rotate_builder
 from fast_transformers.feature_maps import GeneralizedRandomFeatures
 from functools import partial
-import subprocess
 from argparse import ArgumentParser, Namespace
 import numpy as np
 import pandas as pd
@@ -22,10 +21,15 @@ from sklearn.metrics import r2_score
 from sklearn.metrics import accuracy_score, roc_curve, auc
 from torch.utils.data import DataLoader
 from rdkit import Chem
-from molformer.base_bert import LM_Layer
+from molformer.model.base_bert import LM_Layer
 from molformer.utils import normalize_smiles
+from torch.optim import AdamW
+
 #from pytorch_lightning.plugins.ddp_plugin import DDPPlugin
 #from pytorch_lightning.plugins.sharded_plugin import DDPShardedPlugin
+
+import wandb
+
 
 class Net(nn.Module):
         dims = [150, 50, 50, 2]
@@ -106,7 +110,7 @@ class LightningModule(pl.LightningModule):
 
         self.fcs = []  # nn.ModuleList()
         self.loss = torch.nn.CrossEntropyLoss()
-
+        
         self.net = Net(
             config.n_embd, self.hparams.num_classes, dims=config.dims, dropout=config.dropout,
         )
@@ -197,7 +201,6 @@ class LightningModule(pl.LightningModule):
             betas = (0.9, 0.99)
         print('betas are {}'.format(betas))
         learning_rate = self.train_config.lr_start * self.train_config.lr_multiplier
-        from torch.optim import AdamW
         optimizer = AdamW(optim_groups, lr=learning_rate, betas=betas)
         return optimizer
 
@@ -222,7 +225,9 @@ class LightningModule(pl.LightningModule):
         self.log('train_loss', loss, on_step=True)
 
         logs = {"train_loss": loss}
-
+        
+        # wandb.log({"train_loss": loss})
+        wandb.log({"loss": loss})
         return {"loss": loss}
 
     def validation_step(self, val_batch, batch_idx, dataset_idx):
@@ -243,12 +248,21 @@ class LightningModule(pl.LightningModule):
         loss_input = sum_embeddings / sum_mask
         loss, pred, actual = self.get_loss(loss_input, targets)
         self.log('train_loss', loss, on_step=True)
+        
+        wandb.log({
+            "val_loss": loss,
+            "pred": pred.detach(),
+            "actual": actual.detach(),
+            "dataset_idx": dataset_idx,
+        })
+        
         return {
             "val_loss": loss,
             "pred": pred.detach(),
             "actual": actual.detach(),
             "dataset_idx": dataset_idx,
         }
+    
     def validation_epoch_end(self, outputs):
         # results_by_dataset = self.split_results_by_dataset(outputs)
         tensorboard_logs = {}
@@ -372,6 +386,7 @@ class PropertyPredictionDataModule(pl.LightningDataModule):
         super(PropertyPredictionDataModule, self).__init__()
         if type(hparams) is dict:
             hparams = Namespace(**hparams)
+        print(hparams)
         self.hparams = hparams
         self.smiles_emb_size = hparams.n_embd
         self.tokenizer = MolTranBertTokenizer('bert_vocab.txt')
@@ -451,7 +466,6 @@ class PropertyPredictionDataModule(pl.LightningDataModule):
         )
 
 
-
 class CheckpointEveryNSteps(pl.Callback):
     """
         Save a checkpoint every N steps, instead of Lightning's default that checkpoints
@@ -499,7 +513,14 @@ def append_to_file(filename, line):
         f.write(line + "\n")
 
 def main():
-    margs = args.parse_args()
+
+    from attributedict.collections import AttributeDict
+    from molformer.utils import get_argparse_defaults
+    from args import get_parser as ARGS
+
+    margs = AttributeDict(get_argparse_defaults(ARGS()))
+
+
     print("Using " + str(
         torch.cuda.device_count()) + " GPUs---------------------------------------------------------------------")
     pos_emb_type = 'rot'
@@ -522,7 +543,8 @@ def main():
 
     run_name = "_".join(map(str, run_name_fields))
 
-    print(run_name)
+    # print(run_name)
+    
     datamodule = PropertyPredictionDataModule(margs)
     margs.dataset_names = "valid test".split()
     margs.run_name = run_name
@@ -588,4 +610,6 @@ def main():
 
 
 if __name__ == '__main__':
+    wandb.login()
+    wandb.init(project="finetune")
     main()
