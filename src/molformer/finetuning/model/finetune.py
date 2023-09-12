@@ -10,13 +10,13 @@ import wandb
 from molformer.tokenizer import MolTranBertTokenizer
 from lightning.pytorch import seed_everything
 import time
-
+from bert_classification import ModelCheckpointAtEpochEnd, CheckpointEveryNSteps
 
 def main():
 
     margs = AttributeDict(get_argparse_defaults(ARGS()))
     margs.device = 'cuda'
-    margs.batch_size = 40
+    margs.batch_size = 48
     margs.n_head = 12
     margs.n_layer = 12
     margs.n_embd = 768
@@ -24,7 +24,7 @@ def main():
     margs.dropout = 0.1
     margs.lr_start = 3e-5
     margs.num_workers = 8
-    margs.max_epochs = 500
+    margs.max_epochs = 50
     margs.num_feats = 32
     margs.seed_path = '../../../../../molformer/data/Pretrained MoLFormer/checkpoints/N-Step-Checkpoint_3_30000.ckpt'
     margs.dataset_name = 'bace'
@@ -72,12 +72,16 @@ def main():
     results_dir = os.path.join(checkpoint_root, "results")
     margs.results_dir = results_dir
     margs.checkpoint_dir = checkpoint_dir
-    os.makedirs(results_dir, exist_ok=True)
+    # os.makedirs(results_dir, exist_ok=True)
     # os.makedirs(checkpoint_dir, exist_ok=True)
     
 
     # checkpoint_path = os.path.join(checkpoints_folder, margs.measure_name)
-    checkpoint_callback = pl.callbacks.ModelCheckpoint(save_top_k = -1, save_last = True, dirpath=checkpoint_dir, filename='checkpoint', verbose=True)
+    checkpoint_callback = pl.callbacks.ModelCheckpoint(save_top_k = -1, 
+                                                       save_last = True,
+                                                       dirpath=checkpoint_dir, 
+                                                       filename='checkpoint', 
+                                                       verbose=True)
 
 
     tokenizer = MolTranBertTokenizer('../../data/bert_vocab.txt')
@@ -88,8 +92,11 @@ def main():
         model = LightningModule(margs, tokenizer)
     else:
         print(f"# loaded pre-trained model from {margs.seed_path}")
-        model = LightningModule(margs, tokenizer).load_from_checkpoint(margs.seed_path, strict=False, config=margs, tokenizer=tokenizer, vocab=len(tokenizer.vocab))
-
+        model = LightningModule(margs, tokenizer).load_from_checkpoint(margs.seed_path, 
+                                                                       strict=False,    
+                                                                       config=margs, 
+                                                                       tokenizer=tokenizer, 
+                                                                       vocab=len(tokenizer.vocab))
 
     last_checkpoint_file = os.path.join(checkpoint_dir, "last.ckpt")
     
@@ -105,9 +112,10 @@ def main():
         max_epochs=margs.max_epochs,
         log_every_n_steps=10,
         default_root_dir=checkpoint_root,
-        accelerator="cuda",
+        accelerator= "gpu",
         devices=1,
-        enable_checkpointing=checkpoint_callback,
+        callbacks =  [checkpoint_callback],
+        enable_checkpointing= True,
         num_sanity_val_steps=5,
     )
     
@@ -130,8 +138,8 @@ def main():
     print('Time was {}'.format(toc - tic))
 
 
-
 if __name__ == '__main__':
     wandb.login()
-    wandb.init(project="finetune")
+    wandb.init(project="clean_finetune", id = "BACE_BATCH_SIZE_48")
     main()
+    wandb.finish()
