@@ -43,9 +43,9 @@ class LightningModule(pl.LightningModule):
     def __init__(self, config, vocab):
         super(LightningModule, self).__init__()
         
-        print(config.n_batch)
         self.save_hyperparameters(config)
         self.vocabulary = vocab
+        self.attention_type = config.attention_type
         # location of cache File
         # Special symbols
 
@@ -60,8 +60,9 @@ class LightningModule(pl.LightningModule):
             query_dimensions=config.n_embd // config.n_head,
             value_dimensions=config.n_embd // config.n_head,
             feed_forward_dimensions=config.n_embd,
-            attention_type="linear",
+            # attention_type="linear",
             # attention_type='full',
+            attention_type = self.attention_type,
             feature_map=partial(GeneralizedRandomFeatures, n_dims=config.num_feats),
             activation="gelu",
         )
@@ -75,6 +76,7 @@ class LightningModule(pl.LightningModule):
         # if we are starting from scratch set seeds
         
         # config.restart_path = ""
+        config.restart_path = "../../../molformer_XL/checkpoints/checkpoint_2_13000.ckpt"
         if config.restart_path == "":
             seed.seed_everything(config.seed)
 
@@ -168,12 +170,14 @@ class LightningModule(pl.LightningModule):
         return optimizer
 
     def training_step(self, batch, batch_idx):
+
         idxl = batch[0]
         targetsl = batch[1]
         # lengthsl = batch[2]
 
         loss = 0
         loss_tmp = 0
+        
         for chunk in range(len(idxl)):
             idx = idxl[chunk]
             targets = targetsl[chunk]
@@ -187,7 +191,6 @@ class LightningModule(pl.LightningModule):
             # do not attempt to handle it in the forward of the transformer
             x = self.blocks(x)
             logits = self.lang_model(x)
-
             # if we are given targets also calculate the loss
             if targets is not None:
                 # -- mle loss
@@ -210,46 +213,50 @@ class LightningModule(pl.LightningModule):
     #     wandb.log({"validation_loss": loss["loss"]})
     #     self.log("validation_loss", loss["loss"])
 
-    # def validation_step(self, batch, batch_idx):
-    #     idxl = batch[0]
-    #     targetsl = batch[1]
+    def validation_step(self, batch, batch_idx):
+        idxl = batch[0]
+        targetsl = batch[1]
 
-    #     loss = 0
-    #     loss_tmp = 0
-    #     for chunk in range(len(idxl)):
-    #         idx = idxl[chunk]
-    #         targets = targetsl[chunk]
-    #         b, t = idx.size()
-    #         # forward the model
-    #         token_embeddings = self.tok_emb(
-    #             idx
-    #         )  # each index maps to a (learnable) vector
-    #         x = self.drop(token_embeddings)
-    #         x = self.blocks(x)
-    #         logits = self.lang_model(x)
+        loss = 0
+        loss_tmp = 0
+        for chunk in range(len(idxl)):
+            idx = idxl[chunk]
+            targets = targetsl[chunk]
+            b, t = idx.size()
+            # forward the model
+            token_embeddings = self.tok_emb(
+                idx
+            )  # each index maps to a (learnable) vector
+            x = self.drop(token_embeddings)
+            x = self.blocks(x)
+            logits = self.lang_model(x)
 
-    #         # if we are given targets also calculate the loss
-    #         if targets is not None:
-    #             # -- mle loss
-    #             logits = logits.view(-1, logits.size(-1))
-    #             targets = targets.view(-1)
-    #             true_token_lprobs = F.cross_entropy(logits, targets, ignore_index=-100)
-    #             loss_tmp = true_token_lprobs / len(idxl)
-    #         if chunk < len(idxl) - 1:
-    #             loss += loss_tmp.detach()
-    #         else:
-    #             loss += loss_tmp
-    #     wandb.log({"train_loss": loss})
-    #     self.log("train_loss", loss, on_step=True)
-    #     return {"loss": loss}
+            # if we are given targets also calculate the loss
+            if targets is not None:
+                # -- mle loss
+                logits = logits.view(-1, logits.size(-1))
+                targets = targets.view(-1)
+                true_token_lprobs = F.cross_entropy(logits, targets, ignore_index=-100)
+                loss_tmp = true_token_lprobs / len(idxl)
+            if chunk < len(idxl) - 1:
+                loss += loss_tmp.detach()
+            else:
+                loss += loss_tmp
+        wandb.log({"val_loss": loss})
+        print("this is val loss", loss)
+        # self.log("train_loss", loss, on_step=True)
+        return {"loss": loss}
 
 
 class MoleculeModule(pl.LightningDataModule):
-    def __init__(self,  max_len, data_path, train_args):
+    def __init__(self,  max_len, data_path, train_args, dataset_script, dataset):
         super().__init__()
         self.data_path = data_path
         self.train_args = train_args  # dict with keys {'batch_size', 'shuffle', 'num_workers', 'pin_memory'}
         self.text_encoder = Encoder(max_len)
+        dataset_script = './pubchem_script.py'
+        self.dataset_script = dataset_script
+
 
     def prepare_data(self):
         pass
@@ -263,9 +270,9 @@ class MoleculeModule(pl.LightningDataModule):
     def setup(self, stage=None):
         #using huggingface dataloader
         # create cache in tmp directory of locale mabchine under the current users name to prevent locking issues
-        pubchem_path = {'train':'../../../data/pubchem/smiles_large.smi'}
+        pubchem_path = {'train': self.data_path}
         # if 'CANONICAL' in pubchem_path:
-        pubchem_script = './pubchem_script.py'
+        pubchem_script = self.dataset_script
         # else:   
         # pubchem_script = './pubchem_script.py'
         # zinc_path = '../../../data/ZINC'
@@ -278,6 +285,8 @@ class MoleculeModule(pl.LightningDataModule):
 
         # if 'pubchem' in self.data_path:
         dataset_dict =  load_dataset(pubchem_script, data_files=pubchem_path, cache_dir=os.path.join('/tmp',getpass.getuser(), 'pubchem'), split='train')
+        print(vars(dataset_dict))
+    
         # elif 'both' in self.data_path or 'Both' in self.data_path or 'BOTH' in self.data_path:
         #     dataset_dict_pubchem =  load_dataset(pubchem_script, data_files=pubchem_path, cache_dir=os.path.join('/tmp',getpass.getuser(), 'pubchem'),split='train')
         #     zinc_files = [f for f in glob.glob(os.path.join(zinc_path,'*.smi'))]
@@ -287,7 +296,6 @@ class MoleculeModule(pl.LightningDataModule):
         #     dataset_dict_zinc =  load_dataset('./zinc_script.py', data_files=self.data_path, cache_dir=os.path.join('/tmp',getpass.getuser(), 'zinc'),split='train')
         #     dataset_dict = concatenate_datasets([dataset_dict_zinc, dataset_dict_pubchem])
         self.pubchem= dataset_dict
-        print(dataset_dict.cache_files)
         self.cache_files = []
 
         for cache in dataset_dict.cache_files:
@@ -298,8 +306,12 @@ class MoleculeModule(pl.LightningDataModule):
     def train_dataloader(self):
         loader =  DataLoader(self.pubchem, collate_fn=self.text_encoder.process, **self.train_args)
         print(len(loader))
-        return loader
+        return loader   
 
+    def val_dataloader(self):
+        loader =  DataLoader(self.pubchem, collate_fn=self.text_encoder.process, **self.train_args)
+        print(len(loader))
+        return loader 
     # def val_dataloader(self):
     #     pass
     
@@ -326,30 +338,7 @@ class ExponentialScheduleCallback(ModelCheckpoint):
             if trainer.global_step%self.every_n_train_steps == 0:            
                 trainer.save_checkpoint(f"{self.checkpoint_dir}/checkpoint_{trainer.current_epoch}_{trainer.global_step}.ckpt")            
             
-        
-class ModelCheckpointAtEpochEnd(pl.Callback):
-    def on_epoch_end(self, trainer, pl_module):
-        metrics = trainer.callback_metrics
-        metrics['epoch'] = trainer.current_epoch
-        if trainer.disable_validation:
-            trainer.checkpoint_callback.on_validation_end(trainer, pl_module)
             
-
-class SaveCheckpointCustom(pl.Callback):
-    def __init__(self, 
-                 save_step_frequency,
-                 filename, 
-                 checkpoint_dir):
-        
-        self.filename = filename
-        self.save_step_frequency = save_step_frequency
-        self.checkpoint_dir = checkpoint_dir
-        
-    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-        if trainer.global_step%self.save_step_frequency == 0:    
-            trainer.save_checkpoint(f"{self.checkpoint_dir}/checkpoint_{trainer.current_epoch}_{trainer.global_step}.ckpt")
-        
-
 @rank_zero_only
 def remove_tree(cachefiles):
     if type(cachefiles) == type([]):
