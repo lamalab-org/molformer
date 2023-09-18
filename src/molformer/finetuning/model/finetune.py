@@ -14,25 +14,25 @@ from bert_classification import ModelCheckpointAtEpochEnd, CheckpointEveryNSteps
 
 def main():
 
-    margs = AttributeDict(get_argparse_defaults(ARGS()))
-    margs.device = 'cuda'
-    margs.batch_size = 48
-    margs.n_head = 12
-    margs.n_layer = 12
-    margs.n_embd = 768
-    margs.d_dropout = 0.1
-    margs.dropout = 0.1
-    margs.lr_start = 3e-5
-    margs.num_workers = 8
-    margs.max_epochs = 50
-    margs.num_feats = 32
-    margs.seed_path = '../../../../../molformer/data/Pretrained MoLFormer/checkpoints/N-Step-Checkpoint_3_30000.ckpt'
-    margs.dataset_name = 'bace'
-    margs.data_root = '../../../../data/bace'
-    margs.measure_name = 'Class'
-    margs.dims = [768, 768, 768, 1]
-    margs.checkpoints_folder = './checkpoints_bace'
-    margs.num_classes = 2
+    config = AttributeDict(get_argparse_defaults(ARGS()))
+    config.device = 'cuda'
+    config.batch_size = 128
+    config.n_head = 12
+    config.n_layer = 12
+    config.n_embd = 768
+    config.d_dropout = 0.1
+    config.dropout = 0.1
+    config.lr_start = 3e-5
+    config.num_workers = 8
+    config.max_epochs = 50
+    config.num_feats = 32
+    config.seed_path = '../../../../../molformer/data/Pretrained MoLFormer/checkpoints/N-Step-Checkpoint_3_30000.ckpt'
+    config.dataset_name = 'bace'
+    config.data_root = '../../../../data/bace'
+    config.measure_name = 'RingCount'
+    config.dims = [768, 768, 768, 1]
+    config.checkpoints_folder = './checkpoints_bace__RingCount_more_val'
+    config.num_classes = 2
 
 
     print("Using " + str(
@@ -41,83 +41,75 @@ def main():
     print('pos_emb_type is {}'.format(pos_emb_type))
 
     run_name_fields = [
-        margs.dataset_name,
-        margs.measure_name,
+        config.dataset_name,
+        config.measure_name,
         pos_emb_type,
-        margs.fold,
-        margs.mode,
+        config.fold,
+        config.mode,
         "lr",
-        margs.lr_start,
+        config.lr_start,
         "batch",
-        margs.batch_size,
+        config.batch_size,
         "drop",
-        margs.dropout,
-        margs.dims,
+        config.dropout,
+        config.dims,
     ]
 
     run_name = "_".join(map(str, run_name_fields))
 
     print("RUN", run_name)
-    arguments = dict(margs)
+    arguments = dict(config)
     datamodule = PropertyPredictionDataModule(arguments)
-    margs.dataset_names = "valid test".split()
-    margs.run_name = run_name
+    config.dataset_names = "valid test".split()
+    config.run_name = run_name
 
-    checkpoints_folder = margs.checkpoints_folder
+    checkpoints_folder = config.checkpoints_folder
     checkpoint_root = os.path.join(checkpoints_folder)
-    margs.checkpoint_root = checkpoint_root
-    margs.run_id=np.random.randint(30000)
+    config.checkpoint_root = checkpoint_root
+    # config.run_id=np.random.randint(30000)
     os.makedirs(checkpoints_folder, exist_ok=True)
-    checkpoint_dir = os.path.join(checkpoint_root, "models_"+str(margs.run_id))
+    checkpoint_dir = os.path.join(checkpoint_root, "model")
     results_dir = os.path.join(checkpoint_root, "results")
-    margs.results_dir = results_dir
-    margs.checkpoint_dir = checkpoint_dir
-    # os.makedirs(results_dir, exist_ok=True)
+    config.results_dir = results_dir
+    config.checkpoint_dir = checkpoint_dir
+    os.makedirs(results_dir, exist_ok=True)
     # os.makedirs(checkpoint_dir, exist_ok=True)
-    
-
-    # checkpoint_path = os.path.join(checkpoints_folder, margs.measure_name)
-    checkpoint_callback = pl.callbacks.ModelCheckpoint(save_top_k = -1, 
-                                                       save_last = True,
-                                                       dirpath=checkpoint_dir, 
-                                                       filename='checkpoint', 
-                                                       verbose=True)
-
 
     tokenizer = MolTranBertTokenizer('../../data/bert_vocab.txt')
-    seed_everything(margs.seed)
+    seed_everything(config.seed)
 
-    if margs.seed_path == '':
+    if config.seed_path == '':
         print("# training from scratch")
-        model = LightningModule(margs, tokenizer)
+        model = LightningModule(config, tokenizer)
     else:
-        print(f"# loaded pre-trained model from {margs.seed_path}")
-        model = LightningModule(margs, tokenizer).load_from_checkpoint(margs.seed_path, 
+        print(f"# loaded pre-trained model from {config.seed_path}")
+        model = LightningModule(config, tokenizer).load_from_checkpoint(config.seed_path, 
                                                                        strict=False,    
-                                                                       config=margs, 
+                                                                       config=config, 
                                                                        tokenizer=tokenizer, 
                                                                        vocab=len(tokenizer.vocab))
 
-    last_checkpoint_file = os.path.join(checkpoint_dir, "last.ckpt")
+    last_checkpoint_file = config.seed_path 
     
-    resume_from_checkpoint = None
+    from molformer.model.base_bert import ExponentialScheduleCallback
     
-    if os.path.isfile(last_checkpoint_file):
-        print(f"resuming training from : {last_checkpoint_file}")
-        resume_from_checkpoint = last_checkpoint_file
-    else:
-        print(f"training from saved")
-
+    checkpoint_callback = ExponentialScheduleCallback(save_top_k = -1, 
+                                                      dirpath=checkpoint_dir, 
+                                                      filename='molformer', 
+                                                      every_n_train_steps = config.checkpoint_every,
+                                                      verbose=True, 
+                                                      limit_step=50000)
+    
     trainer = pl.Trainer(
-        max_epochs=margs.max_epochs,
-        log_every_n_steps=10,
+        max_epochs=config.max_epochs,
+        log_every_n_steps=100,
         default_root_dir=checkpoint_root,
-        accelerator= "gpu",
+        accelerator= config.device,
         devices=1,
         callbacks =  [checkpoint_callback],
         enable_checkpointing= True,
-        num_sanity_val_steps=5,
-    )
+        num_sanity_val_steps=10
+        )
     
     # trainer = pl.Trainer(default_root_dir=config.root_dir,
     #         max_epochs=config.max_epochs,
@@ -133,13 +125,13 @@ def main():
     #         devices=1)
 
     tic = time.perf_counter()
-    trainer.fit(model, datamodule, ckpt_path=resume_from_checkpoint)
+    trainer.fit(model, datamodule)
     toc = time.perf_counter()
     print('Time was {}'.format(toc - tic))
 
 
 if __name__ == '__main__':
     wandb.login()
-    wandb.init(project="clean_finetune", id = "BACE_BATCH_SIZE_48")
+    wandb.init(project="finetuning_molformer")#, id = "BACE_ring_count")
     main()
     wandb.finish()
