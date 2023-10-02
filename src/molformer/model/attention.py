@@ -32,6 +32,7 @@ class TestBert(nn.Module):
             self.blocks,
             self.drop,
             self.lang_model,
+            # self.net
         ) = self.create_model(config, vocab)
 
         self.drop = nn.Dropout(config.d_dropout)
@@ -39,22 +40,20 @@ class TestBert(nn.Module):
     def create_model(self, config, vocab):
         n_vocab, d_emb = len(vocab.keys()), config.n_embd
         block_size = 250
+
         if config.rotate:
-            builder = rotate_builder.from_kwargs(
-                n_layers=config.n_layer,
-                n_heads=config.n_head,
-                query_dimensions=config.n_embd // config.n_head,
-                value_dimensions=config.n_embd // config.n_head,
-                feed_forward_dimensions=config.n_embd,
-                attention_type="linearwweights",
-                feature_map=partial(
-                    GeneralizedRandomFeatures,
-                    n_dims=config.num_feats,
-                    deterministic_eval=True,
-                ),
-                activation="gelu",
-            )
-            pos_emb = None
+
+            if config.attention_type == "full":
+                builder = rotate_builder.from_kwargs(
+                    n_layers=config.n_layer,
+                    n_heads=config.n_head,
+                    query_dimensions=config.n_embd // config.n_head,
+                    value_dimensions=config.n_embd // config.n_head,
+                    feed_forward_dimensions=config.n_embd,
+                    attention_type=f"{config.attention_type}wweights",
+                    activation="gelu",
+                )
+                pos_emb = None
         else:
             builder = TransformerEncoderBuilder.from_kwargs(
                 n_layers=config.n_layer,
@@ -62,7 +61,7 @@ class TestBert(nn.Module):
                 query_dimensions=config.n_embd // config.n_head,
                 value_dimensions=config.n_embd // config.n_head,
                 feed_forward_dimensions=config.n_embd,
-                attention_type="linearwweights",
+                attention_type=f"{config.attention_type}wweights",
                 feature_map=partial(
                     GeneralizedRandomFeatures,
                     n_dims=config.num_feats,
@@ -76,7 +75,7 @@ class TestBert(nn.Module):
 
         blocks = builder.get()
         lang_model = LM_Layer(config.n_embd, n_vocab)
-
+        # net = self.net
         return tok_emb, pos_emb, blocks, drop, lang_model
 
     def forward(self, batch, mask=None, mode="cls"):

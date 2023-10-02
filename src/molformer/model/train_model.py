@@ -16,11 +16,9 @@ import getpass
 from datasets import load_dataset, concatenate_datasets
 from pubchem_encoder import Encoder
 import lightning.pytorch as pl
-# from pytorch_lightning.utilities import rank_zero_warn, rank_zero_only
 from torch.utils.data import DataLoader
 import subprocess
 import wandb
-# from pytorch_lightning import LightningModule
 from molformer.model.base_bert import LightningModule
 
 from molformer.model.base_bert import fix_infiniband, remove_tree
@@ -47,11 +45,11 @@ def main(name):
     config.num_nodes = 1
     config.accelerator = 'ddp' 
     config.num_feats = 32
-    config.root_dir = './molformer_LARGE'
+    config.root_dir = './symmetric_linear_attention'
     config.checkpoint_every = 1000
     config.train_load = 'both'
     config.mode = 'cls'
-    config.attention_type = 'full'
+    config.attention_type = 'linear'
     # config.restart_path = "../../../molformer_XL/checkpoints/checkpoint_2_13000.ckpt"
     # config.restart_path = "../molformer_refactor/data/checkpoints/N-Step-Checkpoint_3_30000.ckpt"
     config.restart_path = ""
@@ -83,7 +81,7 @@ def main(name):
     checkpoint_dir = os.path.join(config.root_dir, 'checkpoints')
     train_config = {'batch_size': config.n_batch, 'num_workers':config.n_workers, 'pin_memory':True}
     # this should allow us to save a model for every x iterations and it should overwrite
-    
+    config.device = "cuda"
     from base_bert import ExponentialScheduleCallback
     
     checkpoint_callback = ExponentialScheduleCallback(save_top_k = -1, 
@@ -93,7 +91,7 @@ def main(name):
                                                       verbose=True, 
                                                       limit_step=1000)
     
-    train_loader = MoleculeModule(config.max_len, config.train_load, train_config)
+    train_loader = MoleculeModule(config.max_len, config.train_load, train_config, dataset_script = './pubchem_script.py', dataset="../../../data/pubchem/smiles_large.smi")
     train_loader.setup()#config.debug)
     cachefiles = train_loader.get_cache()
     model = LightningModule(config, train_loader.get_vocab())
@@ -112,23 +110,19 @@ def main(name):
                 devices=1)
     
                 # weights_summary='full')
-    # try: 
-    
-    trainer.train(model, train_loader)#, ckpt_path = config.restart_path)
-
-    trainer.fit(model, train_loader)
-    
-    # except Exception as exp: 
-    #     # exit()
-    #     rank_zero_warn('We have caught an error, trying to shut down gracefully')
-    #     remove_tree(cachefiles)
+    try: 
+        trainer.fit(model, train_loader)
+    except Exception as exp: 
+        rank_zero_warn('We have caught an error, trying to shut down gracefully')
+        remove_tree(cachefiles)
+        exit()
 
     if config.debug is True:
         pass
     else:
-        # exit()
         rank_zero_warn('Debug mode not found eraseing cache')
         remove_tree(cachefiles)
+        exit()
 
 
 if __name__ == '__main__':

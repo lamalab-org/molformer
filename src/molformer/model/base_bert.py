@@ -54,18 +54,35 @@ class LightningModule(pl.LightningModule):
         # Word embeddings layer
         n_vocab, d_emb = len(vocab.keys()), config.n_embd
         # input embedding stem
-        builder = rotate_builder.from_kwargs(
-            n_layers=config.n_layer,
-            n_heads=config.n_head,
-            query_dimensions=config.n_embd // config.n_head,
-            value_dimensions=config.n_embd // config.n_head,
-            feed_forward_dimensions=config.n_embd,
-            # attention_type="linear",
-            # attention_type='full',
-            attention_type = self.attention_type,
-            feature_map=partial(GeneralizedRandomFeatures, n_dims=config.num_feats),
-            activation="gelu",
-        )
+        
+        
+        if self.attention_type == 'full':
+            builder = rotate_builder.from_kwargs(
+                n_layers=config.n_layer,
+                n_heads=config.n_head,
+                query_dimensions=config.n_embd // config.n_head,
+                value_dimensions=config.n_embd // config.n_head,
+                feed_forward_dimensions=config.n_embd,
+                # attention_type="linear",
+                # attention_type='full',
+                attention_type = self.attention_type,
+                # feature_map=partial(GeneralizedRandomFeatures, n_dims=config.num_feats),
+                activation="gelu",
+            )
+            
+        else:
+            builder = rotate_builder.from_kwargs(
+                n_layers=config.n_layer,
+                n_heads=config.n_head,
+                query_dimensions=config.n_embd // config.n_head,
+                value_dimensions=config.n_embd // config.n_head,
+                feed_forward_dimensions=config.n_embd,
+                # attention_type="linear",
+                # attention_type='full',
+                attention_type = self.attention_type,
+                feature_map=partial(GeneralizedRandomFeatures, n_dims=config.num_feats),
+                activation="gelu",
+            )
         self.pos_emb = None
         self.tok_emb = nn.Embedding(n_vocab, config.n_embd)
         self.drop = nn.Dropout(config.d_dropout)
@@ -75,8 +92,6 @@ class LightningModule(pl.LightningModule):
         self.train_config = config
         # if we are starting from scratch set seeds
         
-        # config.restart_path = ""
-        config.restart_path = "../../../molformer_XL/checkpoints/checkpoint_2_13000.ckpt"
         if config.restart_path == "":
             seed.seed_everything(config.seed)
 
@@ -256,7 +271,7 @@ class MoleculeModule(pl.LightningDataModule):
         self.text_encoder = Encoder(max_len)
         dataset_script = './pubchem_script.py'
         self.dataset_script = dataset_script
-
+        self.dataset = dataset
 
     def prepare_data(self):
         pass
@@ -270,7 +285,7 @@ class MoleculeModule(pl.LightningDataModule):
     def setup(self, stage=None):
         #using huggingface dataloader
         # create cache in tmp directory of locale mabchine under the current users name to prevent locking issues
-        pubchem_path = {'train': self.data_path}
+        pubchem_path = {'train': self.dataset}
         # if 'CANONICAL' in pubchem_path:
         pubchem_script = self.dataset_script
         # else:   
