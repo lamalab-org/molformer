@@ -2,7 +2,13 @@ from math import sqrt
 from fast_transformers.events import EventDispatcher, AttentionEvent
 import torch
 from torch.nn import Dropout, Module
-
+from fast_transformers.attention_registry import (
+    AttentionRegistry,
+    Optional,
+    Callable,
+    Int,
+    EventDispatcherInstance,
+)
 
 class FullWWeight(Module):
     """
@@ -45,3 +51,12 @@ class FullWWeight(Module):
 
         # Make sure that what we return is contiguous
         return V.contiguous(), attention_weights.detach()
+
+
+AttentionRegistry.register(
+    "fullwweights",
+    FullWWeight,
+    [
+        ("event_dispatcher", Optional(EventDispatcherInstance, "")),
+    ],
+)

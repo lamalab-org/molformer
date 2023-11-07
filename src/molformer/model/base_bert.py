@@ -2,18 +2,27 @@ import torch
 from torch import nn
 import numpy as np
 import random
-
+from lightning.pytorch.utilities import rank_zero_warn, rank_zero_only
 from molformer.model.pubchem_encoder import Encoder
-import pytorch_lightning as pl
-from pytorch_lightning.utilities import seed
+import lightning.pytorch as pl
+# from pytorch_lightning.utilities import seed
 import torch.nn.functional as F
 from functools import partial
+from lightning_fabric.utilities import seed
 
 from molformer.model.attention_modules.rotate_builder import (
     RotateEncoderBuilder as rotate_builder,
 )
 from fast_transformers.feature_maps import GeneralizedRandomFeatures
 from torch.optim import AdamW
+import wandb
+import os 
+import getpass
+import shutil
+from torch.utils.data import DataLoader
+from datasets import load_dataset, concatenate_datasets
+import subprocess
+
 
 class LM_Layer(nn.Module):
     def __init__(self, n_embd, n_vocab):
@@ -33,9 +42,10 @@ class LM_Layer(nn.Module):
 class LightningModule(pl.LightningModule):
     def __init__(self, config, vocab):
         super(LightningModule, self).__init__()
-
+        
         self.save_hyperparameters(config)
         self.vocabulary = vocab
+        self.attention_type = config.attention_type
         # location of cache File
         # Special symbols
 
@@ -44,25 +54,44 @@ class LightningModule(pl.LightningModule):
         # Word embeddings layer
         n_vocab, d_emb = len(vocab.keys()), config.n_embd
         # input embedding stem
-        builder = rotate_builder.from_kwargs(
-            n_layers=config.n_layer,
-            n_heads=config.n_head,
-            query_dimensions=config.n_embd // config.n_head,
-            value_dimensions=config.n_embd // config.n_head,
-            feed_forward_dimensions=config.n_embd,
-            attention_type="linear",
-            # attention_type='full',
-            feature_map=partial(GeneralizedRandomFeatures, n_dims=config.num_feats),
-            activation="gelu",
-        )
+        
+        
+        if self.attention_type == 'full':
+            builder = rotate_builder.from_kwargs(
+                n_layers=config.n_layer,
+                n_heads=config.n_head,
+                query_dimensions=config.n_embd // config.n_head,
+                value_dimensions=config.n_embd // config.n_head,
+                feed_forward_dimensions=config.n_embd,
+                # attention_type="linear",
+                # attention_type='full',
+                attention_type = self.attention_type,
+                # feature_map=partial(GeneralizedRandomFeatures, n_dims=config.num_feats),
+                activation="gelu",
+            )
+            
+        else:
+            builder = rotate_builder.from_kwargs(
+                n_layers=config.n_layer,
+                n_heads=config.n_head,
+                query_dimensions=config.n_embd // config.n_head,
+                value_dimensions=config.n_embd // config.n_head,
+                feed_forward_dimensions=config.n_embd,
+                # attention_type="linear",
+                # attention_type='full',
+                attention_type = self.attention_type,
+                feature_map=partial(GeneralizedRandomFeatures, n_dims=config.num_feats),
+                activation="gelu",
+            )
         self.pos_emb = None
         self.tok_emb = nn.Embedding(n_vocab, config.n_embd)
         self.drop = nn.Dropout(config.d_dropout)
         ## transformer
         self.blocks = builder.get()
-        self.lang_model = self.lm_layer(config.n_embd, n_vocab)
+        self.lang_model = LM_Layer(config.n_embd, n_vocab)
         self.train_config = config
         # if we are starting from scratch set seeds
+        
         if config.restart_path == "":
             seed.seed_everything(config.seed)
 
@@ -156,12 +185,14 @@ class LightningModule(pl.LightningModule):
         return optimizer
 
     def training_step(self, batch, batch_idx):
+
         idxl = batch[0]
         targetsl = batch[1]
         # lengthsl = batch[2]
 
         loss = 0
         loss_tmp = 0
+        
         for chunk in range(len(idxl)):
             idx = idxl[chunk]
             targets = targetsl[chunk]
@@ -175,7 +206,6 @@ class LightningModule(pl.LightningModule):
             # do not attempt to handle it in the forward of the transformer
             x = self.blocks(x)
             logits = self.lang_model(x)
-
             # if we are given targets also calculate the loss
             if targets is not None:
                 # -- mle loss
@@ -188,13 +218,15 @@ class LightningModule(pl.LightningModule):
                 loss += loss_tmp.detach()
             else:
                 loss += loss_tmp
+        wandb.log({"train_loss": loss})
         self.log("train_loss", loss, on_step=True)
         return {"loss": loss}
 
-    def validation_epoch_end(self, outputs):
-        avg_loss = torch.tensor([output["loss"] for output in outputs]).mean()
-        loss = {"loss": avg_loss.item()}
-        self.log("validation_loss", loss["loss"])
+    # def on_validation_epoch_end(self, outputs):
+    #     avg_loss = torch.tensor([output["loss"] for output in outputs]).mean()
+    #     loss = {"loss": avg_loss.item()}
+    #     wandb.log({"validation_loss": loss["loss"]})
+    #     self.log("validation_loss", loss["loss"])
 
     def validation_step(self, batch, batch_idx):
         idxl = batch[0]
@@ -225,5 +257,143 @@ class LightningModule(pl.LightningModule):
                 loss += loss_tmp.detach()
             else:
                 loss += loss_tmp
-        self.log("train_loss", loss, on_step=True)
+        wandb.log({"val_loss": loss})
+        print("this is val loss", loss)
+        # self.log("train_loss", loss, on_step=True)
         return {"loss": loss}
+
+
+class MoleculeModule(pl.LightningDataModule):
+    def __init__(self,  max_len, data_path, train_args, dataset_script, dataset):
+        super().__init__()
+        self.data_path = data_path
+        self.train_args = train_args  # dict with keys {'batch_size', 'shuffle', 'num_workers', 'pin_memory'}
+        self.text_encoder = Encoder(max_len)
+        dataset_script = './pubchem_script.py'
+        self.dataset_script = dataset_script
+        self.dataset = dataset
+
+    def prepare_data(self):
+        pass
+
+    def get_vocab(self):
+        #using home made tokenizer, should look into existing tokenizer
+        return self.text_encoder.char2id
+
+    def get_cache(self):
+        return self.cache_files
+    def setup(self, stage=None):
+        #using huggingface dataloader
+        # create cache in tmp directory of locale mabchine under the current users name to prevent locking issues
+        pubchem_path = {'train': self.dataset}
+        # if 'CANONICAL' in pubchem_path:
+        pubchem_script = self.dataset_script
+        # else:   
+        # pubchem_script = './pubchem_script.py'
+        # zinc_path = '../../../data/ZINC'
+        # if 'ZINC' in self.data_path or 'zinc' in self.data_path:
+        #     zinc_files = [f for f in glob.glob(os.path.join(zinc_path,'*.smi'))]
+        #     for zfile in zinc_files:
+        #         print(zfile)
+        #     self.data_path = {'train': zinc_files}
+        #     dataset_dict = load_dataset('./zinc_script.py', data_files=self.data_path, cache_dir=os.path.join('/tmp',getpass.getuser(), 'zinc'),split='train')
+
+        # if 'pubchem' in self.data_path:
+        dataset_dict =  load_dataset(pubchem_script, data_files=pubchem_path, cache_dir=os.path.join('/tmp',getpass.getuser(), 'pubchem'), split='train')
+        print(vars(dataset_dict))
+    
+        # elif 'both' in self.data_path or 'Both' in self.data_path or 'BOTH' in self.data_path:
+        #     dataset_dict_pubchem =  load_dataset(pubchem_script, data_files=pubchem_path, cache_dir=os.path.join('/tmp',getpass.getuser(), 'pubchem'),split='train')
+        #     zinc_files = [f for f in glob.glob(os.path.join(zinc_path,'*.smi'))]
+        #     for zfile in zinc_files:
+        #         print(zfile)
+        #     self.data_path = {'train': zinc_files}
+        #     dataset_dict_zinc =  load_dataset('./zinc_script.py', data_files=self.data_path, cache_dir=os.path.join('/tmp',getpass.getuser(), 'zinc'),split='train')
+        #     dataset_dict = concatenate_datasets([dataset_dict_zinc, dataset_dict_pubchem])
+        self.pubchem= dataset_dict
+        self.cache_files = []
+
+        for cache in dataset_dict.cache_files:
+            tmp = '/'.join(cache['filename'].split('/')[:4])
+            self.cache_files.append(tmp)
+
+
+    def train_dataloader(self):
+        loader =  DataLoader(self.pubchem, collate_fn=self.text_encoder.process, **self.train_args)
+        print(len(loader))
+        return loader   
+
+    def val_dataloader(self):
+        loader =  DataLoader(self.pubchem, collate_fn=self.text_encoder.process, **self.train_args)
+        print(len(loader))
+        return loader 
+    # def val_dataloader(self):
+    #     pass
+    
+    # def test_dataloader(self):
+    #     pass
+    
+
+from lightning.pytorch.callbacks import ModelCheckpoint
+
+class ExponentialScheduleCallback(ModelCheckpoint):
+    def __init__(self, limit_step, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.limit_step = limit_step
+        self.every_n_train_steps = kwargs['every_n_train_steps']
+        self.checkpoint_dir = kwargs['dirpath']
+        
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        
+        if trainer.global_step < self.limit_step:
+            if trainer.global_step%(self.every_n_train_steps/25) == 0:            
+                trainer.save_checkpoint(f"{self.checkpoint_dir}/checkpoint_{trainer.current_epoch}_{trainer.global_step}.ckpt")    
+        
+        elif trainer.global_step > self.limit_step:
+            if trainer.global_step%self.every_n_train_steps == 0:            
+                trainer.save_checkpoint(f"{self.checkpoint_dir}/checkpoint_{trainer.current_epoch}_{trainer.global_step}.ckpt")            
+            
+            
+@rank_zero_only
+def remove_tree(cachefiles):
+    if type(cachefiles) == type([]):
+        #if cachefiles are identical remove all but one file path
+        cachefiles = list(set(cachefiles))
+        for cache in cachefiles:
+            shutil.rmtree(cache)
+    else:
+        shutil.rmtree(cachefiles)
+
+
+def get_nccl_socket_ifname():
+    ipa = subprocess.run(['ip', 'a'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    lines = ipa.stdout.decode('utf-8').split('\n')
+    all_names = []
+    name = None
+    for line in lines:
+        if line and not line[0] == ' ':
+            name = line.split(':')[1].strip()
+            continue
+        if 'link/infiniband' in line:
+            all_names.append(name)
+    os.environ['NCCL_SOCKET_IFNAME'] = ','.join(all_names)
+
+
+def fix_infiniband():
+
+    get_nccl_socket_ifname()
+    os.environ['NCCL_IB_CUDA_SUPPORT'] = '1'
+    ibv = subprocess.run('ibv_devinfo', stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    lines = ibv.stdout.decode('utf-8').split('\n')
+    exclude = ''
+    for line in lines:
+        if 'hca_id:' in line:
+            name = line.split(':')[1].strip()
+        if '\tport:' in line:
+            port = line.split(':')[1].strip()
+        if 'link_layer:' in line and 'Ethernet' in line:
+            exclude = exclude + f'{name}:{port},'
+    if exclude:
+        exclude = '^' + exclude[:-1]
+        # print(exclude)
+        os.environ['NCCL_IB_HCA'] = exclude

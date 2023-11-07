@@ -5,27 +5,28 @@ import os
 import torch.nn.functional as F
 import numpy as np
 import random
-from pytorch_lightning.loggers import TensorBoardLogger
-import pytorch_lightning as pl
-from pytorch_lightning.utilities import rank_zero_warn, rank_zero_only, seed
+from lightning.pytorch.loggers import TensorBoardLogger
+import lightning.pytorch as pl
+from lightning.pytorch.utilities import rank_zero_warn, rank_zero_only
+from lightning.pytorch import seed_everything
 from molformer.tokenizer import MolTranBertTokenizer
 from fast_transformers.masking import LengthMask as LM
-from attention_modules.rotate_builder import RotateEncoderBuilder as rotate_builder
+from molformer.model.attention_modules.rotate_builder import RotateEncoderBuilder as rotate_builder
 from fast_transformers.feature_maps import GeneralizedRandomFeatures
 from functools import partial
-import subprocess
 from argparse import ArgumentParser, Namespace
 import numpy as np
 import pandas as pd
-from scipy.stats import pearsonr
-from sklearn.metrics import r2_score
-from sklearn.metrics import accuracy_score, roc_curve, auc
+# from scipy.stats import pearsonr
+# from sklearn.metrics import r2_score
+# from sklearn.metrics import accuracy_score, roc_curve, auc
 from torch.utils.data import DataLoader
-from rdkit import Chem
-from molformer.base_bert import LM_Layer
+# from rdkit import Chem
+from molformer.model.base_bert import LM_Layer
 from molformer.utils import normalize_smiles
-#from pytorch_lightning.plugins.ddp_plugin import DDPPlugin
-#from pytorch_lightning.plugins.sharded_plugin import DDPShardedPlugin
+from torch.optim import AdamW
+import wandb
+
 
 class Net(nn.Module):
         dims = [150, 50, 50, 2]
@@ -70,13 +71,13 @@ class LightningModule(pl.LightningModule):
         super(LightningModule, self).__init__()
 
         self.config = config
-        self.hparams = config
+        # self.hparams = config
         self.mode = config.mode
         self.save_hyperparameters(config)
         self.tokenizer=tokenizer
         self.min_loss = {
-            self.hparams.measure_name + "min_valid_loss": torch.finfo(torch.float32).max,
-            self.hparams.measure_name + "min_epoch": 0,
+            self.config.measure_name + "min_valid_loss": torch.finfo(torch.float32).max,
+            self.config.measure_name + "min_epoch": 0,
         }
 
         # Word embeddings layer
@@ -106,7 +107,7 @@ class LightningModule(pl.LightningModule):
 
         self.fcs = []  # nn.ModuleList()
         self.loss = torch.nn.CrossEntropyLoss()
-
+        
         self.net = Net(
             config.n_embd, self.hparams.num_classes, dims=config.dims, dropout=config.dropout,
         )
@@ -197,11 +198,11 @@ class LightningModule(pl.LightningModule):
             betas = (0.9, 0.99)
         print('betas are {}'.format(betas))
         learning_rate = self.train_config.lr_start * self.train_config.lr_multiplier
-        from torch.optim import AdamW
         optimizer = AdamW(optim_groups, lr=learning_rate, betas=betas)
         return optimizer
 
-    def training_step(self, batch, batch_idx):
+    def training_step(self, batch, batch_idx,  dataloader_idx=0):
+        dataset_idx = dataloader_idx
         idx = batch[0]
         mask = batch[1]
         targets = batch[-1]
@@ -222,10 +223,12 @@ class LightningModule(pl.LightningModule):
         self.log('train_loss', loss, on_step=True)
 
         logs = {"train_loss": loss}
-
+        
+        # wandb.log({"train_loss": loss})
+        wandb.log({"loss": loss})
         return {"loss": loss}
 
-    def validation_step(self, val_batch, batch_idx, dataset_idx):
+    def validation_step(self, val_batch, batch_idx,  dataloader_idx=1):
         idx =     val_batch[0]
         mask = val_batch[1]
         targets = val_batch[-1]
@@ -243,97 +246,18 @@ class LightningModule(pl.LightningModule):
         loss_input = sum_embeddings / sum_mask
         loss, pred, actual = self.get_loss(loss_input, targets)
         self.log('train_loss', loss, on_step=True)
+        dataset_idx = dataloader_idx
+        wandb.log({
+            "val_loss": loss,
+            "pred": pred.detach(),
+            "actual": actual.detach(),
+        })
+        
         return {
             "val_loss": loss,
             "pred": pred.detach(),
             "actual": actual.detach(),
-            "dataset_idx": dataset_idx,
         }
-    def validation_epoch_end(self, outputs):
-        # results_by_dataset = self.split_results_by_dataset(outputs)
-        tensorboard_logs = {}
-        for dataset_idx, batch_outputs in enumerate(outputs):
-            dataset = self.hparams.dataset_names[dataset_idx]
-            #print("x_val_loss:", batch_outputs[0]["val_loss"])
-            avg_loss = torch.stack([x["val_loss"] for x in batch_outputs]).mean()
-            preds = torch.cat([x["pred"] for x in batch_outputs])
-            actuals = torch.cat([x["actual"] for x in batch_outputs])
-            val_loss = self.loss(preds, actuals)
-
-            actuals_cpu = actuals.detach().cpu().numpy()
-            #preds_cpu = preds.detach().cpu().numpy() #preds_cpu is logits
-            preds_cpu = F.softmax(preds, dim=1).cpu().numpy()
-
-            #classif
-            preds_cpu = preds_cpu[:, 1]
-            fpr, tpr, threshold = roc_curve(actuals_cpu, preds_cpu)
-            roc_auc = auc(fpr, tpr)
-
-            print(dataset,':rocauc:', roc_auc)
-            y_pred = np.where(preds_cpu >= 0.5, 1, 0)
-            accuracy = accuracy_score(actuals_cpu, y_pred)
-            tensorboard_logs.update(
-                {
-                    # dataset + "_avg_val_loss": avg_loss,
-                    self.hparams.measure_name + "_" + dataset + "_loss": val_loss,
-                    self.hparams.measure_name + "_" + dataset + "_acc": accuracy,
-                    self.hparams.measure_name + "_" + dataset + "_rocauc": roc_auc,
-                }
-            )
-
-        if (
-            tensorboard_logs[self.hparams.measure_name + "_valid_loss"]
-            < self.min_loss[self.hparams.measure_name + "min_valid_loss"]
-        ):
-            self.min_loss[self.hparams.measure_name + "min_valid_loss"] = tensorboard_logs[
-                self.hparams.measure_name + "_valid_loss"
-            ]
-            self.min_loss[self.hparams.measure_name + "min_test_loss"] = tensorboard_logs[
-                self.hparams.measure_name + "_test_loss"
-            ]
-            self.min_loss[self.hparams.measure_name + "min_epoch"] = self.current_epoch
-            self.min_loss[self.hparams.measure_name + "max_valid_rocauc"] = tensorboard_logs[
-                self.hparams.measure_name + "_valid_rocauc"
-            ]
-            self.min_loss[self.hparams.measure_name + "max_test_rocauc"] = tensorboard_logs[
-                self.hparams.measure_name + "_test_rocauc"
-            ]
-
-
-
-        tensorboard_logs[self.hparams.measure_name + "_min_valid_loss"] = self.min_loss[
-            self.hparams.measure_name + "min_valid_loss"
-        ]
-        tensorboard_logs[self.hparams.measure_name + "_min_test_loss"] = self.min_loss[
-            self.hparams.measure_name + "min_test_loss"
-        ]
-        tensorboard_logs[self.hparams.measure_name + "_max_test_rocauc"] = self.min_loss[
-            self.hparams.measure_name + "max_test_rocauc"
-        ]
-        tensorboard_logs[self.hparams.measure_name + "_max_valid_rocauc"] = self.min_loss[
-            self.hparams.measure_name + "max_valid_rocauc"
-        ]
-
-
-
-        self.logger.log_metrics(tensorboard_logs, self.global_step)
-
-        for k in tensorboard_logs.keys():
-            self.log(k, tensorboard_logs[k])
-
-        print("Validation: Current Epoch", self.current_epoch)
-        append_to_file(
-            os.path.join(self.hparams.results_dir, "results_" + str(self.hparams.run_id)+".csv"),
-            f"{self.hparams.measure_name}, {self.current_epoch},"
-            + f"{tensorboard_logs[self.hparams.measure_name + '_valid_loss']},"
-            + f"{tensorboard_logs[self.hparams.measure_name + '_test_loss']},"
-            + f"{self.min_loss[self.hparams.measure_name + 'min_epoch']},"
-            + f"{self.min_loss[self.hparams.measure_name + 'max_valid_rocauc']},"
-            + f"{self.min_loss[self.hparams.measure_name + 'max_test_rocauc']}",
-        )
-
-        return {"avg_val_loss": avg_loss}
-
 
 def get_dataset(data_root, filename,  dataset_len, aug, measure_name):
     df = pd.read_csv(os.path.join(data_root, filename))
@@ -370,12 +294,24 @@ class PropertyPredictionDataset(torch.utils.data.Dataset):
 class PropertyPredictionDataModule(pl.LightningDataModule):
     def __init__(self, hparams):
         super(PropertyPredictionDataModule, self).__init__()
-        if type(hparams) is dict:
-            hparams = Namespace(**hparams)
-        self.hparams = hparams
-        self.smiles_emb_size = hparams.n_embd
-        self.tokenizer = MolTranBertTokenizer('bert_vocab.txt')
-        self.dataset_name = hparams.dataset_name
+        
+        print("hparamsss", hparams)
+        self.hparams_ = Namespace(**hparams)
+        
+        # self.hparams = self.hparams_
+        # self.hparams.data_root = 
+        # self.hparams.train_dataset_length = None
+        # self.hparams.aug = None
+        # self.measure_name = 'Class'
+        # self.hparams.eval_dataset_length = None
+        # self.hparams.batch_size = 128
+        # self.hparams.num_workers = 8
+
+        # print(type(hparams))
+        # self.hparams = hparams
+        # self.smiles_emb_size = hparams.n_embd
+        self.tokenizer = MolTranBertTokenizer('../../data/bert_vocab.txt')
+        # self.dataset_name = hparams.dataset_name
 
     def get_split_dataset_filename(dataset_name, split):
         return split + ".csv"
@@ -383,39 +319,39 @@ class PropertyPredictionDataModule(pl.LightningDataModule):
     def prepare_data(self):
         print("Inside prepare_dataset")
         train_filename = PropertyPredictionDataModule.get_split_dataset_filename(
-            self.dataset_name, "train"
+            self.hparams_.dataset_name, "train"
         )
 
         valid_filename = PropertyPredictionDataModule.get_split_dataset_filename(
-            self.dataset_name, "valid"
+            self.hparams_.dataset_name, "valid"
         )
 
         test_filename = PropertyPredictionDataModule.get_split_dataset_filename(
-            self.dataset_name, "test"
+            self.hparams_.dataset_name, "test"
         )
 
         train_ds = get_dataset(
-            self.hparams.data_root,
+            self.hparams_.data_root,
             train_filename,
-            self.hparams.train_dataset_length,
-            self.hparams.aug,
-            measure_name=self.hparams.measure_name,
+            self.hparams_.train_dataset_length,
+            self.hparams_.aug,
+            measure_name="Class",
         )
 
         val_ds = get_dataset(
-            self.hparams.data_root,
+            self.hparams_.data_root,
             valid_filename,
-            self.hparams.eval_dataset_length,
+            self.hparams_.eval_dataset_length,
             aug=False,
-            measure_name=self.hparams.measure_name,
+            measure_name="Class",
         )
 
         test_ds = get_dataset(
-            self.hparams.data_root,
+            self.hparams_.data_root,
             test_filename,
-            self.hparams.eval_dataset_length,
+            self.hparams_.eval_dataset_length,
             aug=False,
-            measure_name=self.hparams.measure_name,
+            measure_name="Class",
         )
 
         self.train_ds = train_ds
@@ -426,15 +362,19 @@ class PropertyPredictionDataModule(pl.LightningDataModule):
         # )
 
     def collate(self, batch):
-        tokens = self.tokenizer.batch_encode_plus([ smile[0] for smile in batch], padding=True, add_special_tokens=True)
-        return (torch.tensor(tokens['input_ids']), torch.tensor(tokens['attention_mask']), torch.tensor([smile[1] for smile in batch]))
+        tokens = self.tokenizer.batch_encode_plus([ smile[0] for smile in batch], 
+                                                  padding=True, 
+                                                  add_special_tokens=True)
+        return (torch.tensor(tokens['input_ids']), 
+                torch.tensor(tokens['attention_mask']), 
+                torch.tensor([smile[1] for smile in batch]))
 
     def val_dataloader(self):
         return [
             DataLoader(
                 ds,
-                batch_size=self.hparams.batch_size,
-                num_workers=self.hparams.num_workers,
+                batch_size=self.hparams_.batch_size,
+                num_workers=self.hparams_.num_workers,
                 shuffle=False,
                 collate_fn=self.collate,
             )
@@ -442,14 +382,14 @@ class PropertyPredictionDataModule(pl.LightningDataModule):
         ]
 
     def train_dataloader(self):
+        print("batch_size", self.hparams_.batch_size)
         return DataLoader(
             self.train_ds,
-            batch_size=self.hparams.batch_size,
-            num_workers=self.hparams.num_workers,
+            batch_size=self.hparams_.batch_size,
+            num_workers=self.hparams_.num_workers,
             shuffle=True,
             collate_fn=self.collate,
         )
-
 
 
 class CheckpointEveryNSteps(pl.Callback):
@@ -458,9 +398,9 @@ class CheckpointEveryNSteps(pl.Callback):
         based on validation loss.
     """
 
-    def __init__(self, save_step_frequency=-1,
+    def __init__(self, save_step_frequency=30,
         prefix="N-Step-Checkpoint",
-        use_modelcheckpoint_filename=False,
+        use_modelcheckpoint_filename=True,
         ):
         """
         Args:
@@ -471,22 +411,27 @@ class CheckpointEveryNSteps(pl.Callback):
         self.save_step_frequency = save_step_frequency
         self.prefix = prefix
         self.use_modelcheckpoint_filename = use_modelcheckpoint_filename
+        
+        
     def on_batch_end(self, trainer: pl.Trainer, _):
+        
         """ Check if we should save a checkpoint after every train batch """
         epoch = trainer.current_epoch
         global_step = trainer.global_step
 
-        if global_step % self.save_step_frequency == 0 and self.save_step_frequency > 10:
+        if global_step % self.save_step_frequency == 0 and self.save_step_frequency >= 10:
 
             if self.use_modelcheckpoint_filename:
                 filename = trainer.checkpoint_callback.filename
             else:
                 filename = f"{self.prefix}_{epoch}_{global_step}.ckpt"
                 #filename = f"{self.prefix}.ckpt"
-            ckpt_path = os.path.join(trainer.checkpoint_callback.dirpath, filename)
-            trainer.save_checkpoint(ckpt_path)
+            # ckpt_path = os.path.join(trainer.checkpoint_callback.dirpath, filename)
+            trainer.save_checkpoint(filename)
+
 
 class ModelCheckpointAtEpochEnd(pl.Callback):
+    
     def on_epoch_end(self, trainer, pl_module):
         metrics = trainer.callback_metrics
         metrics['epoch'] = trainer.current_epoch
@@ -498,94 +443,3 @@ def append_to_file(filename, line):
     with open(filename, "a") as f:
         f.write(line + "\n")
 
-def main():
-    margs = args.parse_args()
-    print("Using " + str(
-        torch.cuda.device_count()) + " GPUs---------------------------------------------------------------------")
-    pos_emb_type = 'rot'
-    print('pos_emb_type is {}'.format(pos_emb_type))
-
-    run_name_fields = [
-        margs.dataset_name,
-        margs.measure_name,
-        pos_emb_type,
-        margs.fold,
-        margs.mode,
-        "lr",
-        margs.lr_start,
-        "batch",
-        margs.batch_size,
-        "drop",
-        margs.dropout,
-        margs.dims,
-    ]
-
-    run_name = "_".join(map(str, run_name_fields))
-
-    print(run_name)
-    datamodule = PropertyPredictionDataModule(margs)
-    margs.dataset_names = "valid test".split()
-    margs.run_name = run_name
-
-    checkpoints_folder = margs.checkpoints_folder
-    checkpoint_root = os.path.join(checkpoints_folder, margs.measure_name)
-    margs.checkpoint_root = checkpoint_root
-    margs.run_id=np.random.randint(30000)
-    os.makedirs(checkpoints_folder, exist_ok=True)
-    checkpoint_dir = os.path.join(checkpoint_root, "models_"+str(margs.run_id))
-    results_dir = os.path.join(checkpoint_root, "results")
-    margs.results_dir = results_dir
-    margs.checkpoint_dir = checkpoint_dir
-    os.makedirs(results_dir, exist_ok=True)
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    
-
-    checkpoint_path = os.path.join(checkpoints_folder, margs.measure_name)
-    checkpoint_callback = pl.callbacks.ModelCheckpoint(period=1, save_last=True, dirpath=checkpoint_dir, filename='checkpoint', verbose=True)
-
-    print(margs)
-
-    logger = TensorBoardLogger(
-        save_dir=checkpoint_root,
-        #version=run_name,
-        name="lightning_logs",
-        default_hp_metric=False,
-    )
-
-    tokenizer = MolTranBertTokenizer('bert_vocab.txt')
-    seed.seed_everything(margs.seed)
-
-    if margs.seed_path == '':
-        print("# training from scratch")
-        model = LightningModule(margs, tokenizer)
-    else:
-        print("# loaded pre-trained model from {args.seed_path}")
-        model = LightningModule(margs, tokenizer).load_from_checkpoint(margs.seed_path, strict=False, config=margs, tokenizer=tokenizer, vocab=len(tokenizer.vocab))
-
-
-    last_checkpoint_file = os.path.join(checkpoint_dir, "last.ckpt")
-    resume_from_checkpoint = None
-    if os.path.isfile(last_checkpoint_file):
-        print(f"resuming training from : {last_checkpoint_file}")
-        resume_from_checkpoint = last_checkpoint_file
-    else:
-        print(f"training from scratch")
-
-    trainer = pl.Trainer(
-        max_epochs=margs.max_epochs,
-        default_root_dir=checkpoint_root,
-        gpus=1,
-        logger=logger,
-        resume_from_checkpoint=resume_from_checkpoint,
-        checkpoint_callback=checkpoint_callback,
-        num_sanity_val_steps=0,
-    )
-
-    tic = time.perf_counter()
-    trainer.fit(model, datamodule)
-    toc = time.perf_counter()
-    print('Time was {}'.format(toc - tic))
-
-
-if __name__ == '__main__':
-    main()
